@@ -158,11 +158,30 @@
 <body>
 <div class="wrap">
 
+<script>
+// Embedded in the Livestream Everywhere panel? Everything we fetch is relative,
+// so a <base> under /studio/ makes the same file work on both hosts.
+window.STUDIO_EMBEDDED = location.pathname.indexOf('/studio') === 0;
+if (window.STUDIO_EMBEDDED) {
+  var b = document.createElement('base'); b.href = '/_gen/';   // API prefix; page stays at /studio/
+  document.head.insertBefore(b, document.head.firstChild);
+}
+</script>
 <header>
-  <h1 id="appTitle">Studio Generation Center</h1>
+  <h1 id="appTitle">Jefizzle Studio</h1>
   <div class="sub">quick remote control for the studio machines &middot;
-    <b>ComfyUI is untouched and still yours</b> &middot; <span id="clock"></span></div>
+    <b>ComfyUI is untouched and still yours</b> &middot; <span id="clock"></span> &middot;
+    <a id="panelLink" href="#" target="_blank" style="color:#8ab4e8">Livestream panel →</a></div>
 </header>
+<script>
+// Jefizzle Studio is LAN-only; point "back to panel" at wherever this page is served from.
+(function(){ try {
+  var link = document.getElementById('panelLink');
+  if (window.STUDIO_EMBEDDED) { if (link) link.parentNode.style.display = 'none'; return; }
+  var host = location.hostname || 'localhost';
+  if (link) link.href = 'http://' + host + ':8765/';
+} catch(e){} })();
+</script>
 
 <div class="card">
   <h2>Machines <span class="tag" id="laneTag">checking</span></h2>
@@ -930,6 +949,7 @@ async function pollJobs(){
       + '<br>' + ago(j.finished || j.created) + '</div>'
       + '<div class="ga">' + chain
       + '<button class="btn ghost" onclick="reuse(\'' + j.id + '\')">Use this again</button>'
+            + (o && o.media === 'image' ? '<button class="btn ghost" data-l="' + encodeURIComponent(j.lane) + '" data-f="' + encodeURIComponent(o.filename) + '" data-s="' + encodeURIComponent(o.subfolder||'') + '" onclick="useAsThumb(this)">🖼 Use as thumbnail</button>' : '')
       + (o ? '<a class="btn ghost" href="' + viewURL(j.lane,o,true) + '">Save</a>' : '')
       + '<button class="btn ghost" onclick="forget(\'' + j.id + '\')">Remove</button>' + '</div>'
       + '</div></div>';
@@ -978,6 +998,29 @@ function reuse(id){
   window.scrollTo({top:0, behavior:'smooth'});
 }
 async function cancelJob(id, lane){ await postJSON('/api/cancel', {job_id:id, lane:lane}); pollJobs(); }
+async function useAsThumb(btn){
+  const body = JSON.stringify({lane: decodeURIComponent(btn.dataset.l), filename: btn.dataset.f, subfolder: decodeURIComponent(btn.dataset.s)});
+  const targets = [];
+  try { if (window.self !== window.top) targets.push('/api/thumb'); } catch(e){}
+  const host = location.hostname || 'localhost';
+  if (location.port !== '8765') targets.push('http://' + host + ':8765/api/thumb');
+  else targets.push('/api/thumb');
+  btn.disabled = true; const old = btn.textContent; btn.textContent = 'publishing…';
+  let lastErr = 'no panel reachable';
+  for (const t of targets){
+    try {
+      const r = await fetch(t, {method:'POST', headers:{'Content-Type':'application/json'}, body});
+      if (!r.ok) { lastErr = 'HTTP ' + r.status; continue; }
+      const d = await r.json();
+      if (d.ok && d.url) { try { parent.postMessage({t:'thumb-set', url:d.url, file:d.file}, '*'); } catch(e){}
+        btn.textContent = '✓ thumbnail set';
+        setTimeout(()=>{ if(btn.isConnected) btn.textContent = old; }, 4000); return; }
+      lastErr = d.error || 'no url';
+    } catch(e){ lastErr = e.message; }
+  }
+  btn.textContent = old; btn.disabled = false;
+  alert('could not set thumbnail: ' + lastErr + '\n(open the livestream panel at :8765 and retry)');
+}
 function lightbox(u){ const lb = $('#lightbox'); lb.innerHTML = '<img src="'+u+'">';
   lb.classList.add('on'); lb.onclick = () => lb.classList.remove('on'); }
 

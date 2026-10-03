@@ -67,10 +67,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # ---------------------------------------------------------------------------
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+EMBEDDED = bool(os.environ.get("LIVESTREAM_PANEL_PORT"))  # set by livestream-server.py
 DATA_DIR = os.path.join(APP_DIR, "data")
 CHAIN_DIR = os.path.join(DATA_DIR, "chain")
 JOBS_FILE = os.path.join(DATA_DIR, "jobs.json")
-CONFIG_FILE = os.environ.get("GENCENTER_CONFIG") or os.path.join(APP_DIR, "config.json")
+if EMBEDDED:
+    # Single-host mode: the panel owns the studio config; shared data dir.
+    _panel_dir = os.path.dirname(APP_DIR)
+    CONFIG_FILE = os.environ.get("STUDIO_CONFIG") or os.path.join(_panel_dir, "studio-config.json")
+else:
+    CONFIG_FILE = os.environ.get("GENCENTER_CONFIG") or os.path.join(APP_DIR, "config.json")
 EXAMPLE_FILE = os.path.join(APP_DIR, "config.example.json")
 
 MODEL_KEYS = (
@@ -83,7 +89,13 @@ MODEL_KEYS = (
 LANE_KEYS = ("id", "name", "host", "port")
 
 
+class StudioConfigError(RuntimeError):
+    """Raised by load_config() in embedded mode instead of killing the host."""
+
+
 def die(msg):
+    if EMBEDDED:
+        raise StudioConfigError(msg.strip())
     sys.stderr.write("\n" + msg.rstrip() + "\n\n")
     raise SystemExit(2)
 
@@ -1234,18 +1246,59 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "GenerationCenter/1.0"
 
+    def handle_one_request(self):
+        # When mounted by the livestream panel, the request line and headers
+        # were already parsed by the panel's handler; run this one request and
+        # hand the socket back — never re-read from it.
+        if getattr(self, "requestline", ""):
+            try:
+                # requestline arrives fully formed from the panel mount; no re-parse
+                self.path = self.requestline
+                if not self.path.startswith("/"):
+                    self.send_error(400, "Bad path"); self.close_connection = True; return
+                self.close_connection = True
+                if self.command == "POST":
+                    self.do_POST()
+                elif self.command in ("GET", "HEAD"):
+                    self.do_GET()
+                else:
+                    self.send_error(501, "Unsupported method")
+            except Exception:
+                traceback.print_exc()
+                try: self.send_error(500)
+                except Exception: pass
+            return
+        super().handle_one_request()
+
     def log_message(self, fmt, *args):
         pass
 
     # -- helpers ------------------------------------------------------------
     def send_json(self, obj, code=200):
         body = json.dumps(obj).encode("utf-8")
+        self.close_connection = True
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self.send_header("Cache-Control", "no-store")
+        self._cors()
         self.end_headers()
         self.wfile.write(body)
+
+    def _cors(self):
+        # LAN-only cross-origin read (the livestream panel pulls /api/lanes and
+        # /api/view from :8765). Only origins on this host are echoed back.
+        # Only LAN/loopback origins get CORS — matches the hosts in config.json lanes.
+        origin = self.headers.get("Origin", "")
+        m = re.match(r"^https?://([^:/]+)(:\d+)?$", origin)
+        if m:
+            host = m.group(1)
+            lan = (host == "localhost" or host == "127.0.0.1"
+                   or host.startswith("192.168.") or host.startswith("10.")
+                   or host.startswith("172."))
+            if lan:
+                self.send_header("Access-Control-Allow-Origin", origin)
 
     def send_blob(self, data, ctype, filename=None, download=False, ranges=False):
         """`ranges=True` serves a real 206 when asked. Safari will not play a
@@ -1264,21 +1317,26 @@ class Handler(BaseHTTPRequestHandler):
                 if start <= end:
                     partial = True
         body = data[start:end + 1] if partial else data
+        self.close_connection = True
         self.send_response(206 if partial else 200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self.send_header("Accept-Ranges", "bytes" if ranges else "none")
         if partial:
             self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, len(data)))
         if filename:
             disp = "attachment" if download else "inline"
             self.send_header("Content-Disposition", '%s; filename="%s"' % (disp, filename))
+        self._cors()
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
 
     def read_body(self):
-        n = int(self.headers.get("Content-Length") or 0)
+        n = getattr(self, "content_length", None)
+        if n is None:
+            n = int(self.headers.get("Content-Length") or 0)
         buf = b""
         while len(buf) < n:
             chunk = self.rfile.read(min(65536, n - len(buf)))
@@ -1292,12 +1350,30 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- GET ----------------------------------------------------------------
     def do_GET(self):
-        u = urllib.parse.urlparse(self.path)
+        if EMBEDDED and (self.path.startswith("/studio") or self.path.startswith("/_gen")):
+            rest = self.path.split("/", 2)[-1] or "/"
+            if not rest.startswith("/"): rest = "/" + rest
+            return Handler._dispatch_get(self, rest)
+        return Handler._dispatch_get(self, self.path)
+
+    def _dispatch_get(self, path):
+        u = urllib.parse.urlparse(path)
         q = urllib.parse.parse_qs(u.query)
         try:
-            if u.path in ("/", "/index.html"):
+            if u.path in ("/", "/index.html", "/studio/", "/studio/index.html", "/studio-assets/index.html"):
                 with open(os.path.join(APP_DIR, "index.html"), "rb") as f:
-                    return self.send_blob(f.read(), "text/html; charset=utf-8")
+                    data = f.read()
+                self.close_connection = True
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Connection", "close")
+                self.send_header("Cache-Control", "no-store")
+                self._cors()
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(data)
+                return
             if u.path == "/api/lanes":
                 return self.send_json(self.lanes_payload())
             if u.path == "/api/jobs":
@@ -1374,13 +1450,23 @@ class Handler(BaseHTTPRequestHandler):
             "type": (q.get("type") or ["output"])[0],
         }
         url = lane_url(lane, "/view?" + urllib.parse.urlencode(params))
-        data, ctype = http_get_bytes(url, timeout=120.0)
+        try:
+            data, ctype = http_get_bytes(url, timeout=120.0)
+        except Exception as e:
+            return self.send_json({"error": "lane fetch failed: %s" % e}, 502)
         download = (q.get("dl") or ["0"])[0] == "1"
         return self.send_blob(data, ctype, os.path.basename(params["filename"]), download, ranges=True)
 
     # -- POST ---------------------------------------------------------------
     def do_POST(self):
-        u = urllib.parse.urlparse(self.path)
+        if EMBEDDED and (self.path.startswith("/studio") or self.path.startswith("/_gen")):
+            rest = self.path.split("/", 2)[-1]
+            if not rest.startswith("/"): rest = "/" + rest
+            return Handler._dispatch_post(self, rest)
+        return Handler._dispatch_post(self, self.path)
+
+    def _dispatch_post(self, path):
+        u = urllib.parse.urlparse(path)
         try:
             if u.path == "/api/upload":
                 return self.api_upload()
@@ -1637,6 +1723,21 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_json({"ok": True})
 
 
+def start_backend():
+    """Embedded mode: bring up the studio engine (pollers, ws listeners, jobs)
+    WITHOUT binding a port. The livestream panel mounts us at /studio/* and
+    serves our Handler through its own socket."""
+    load_jobs()
+    for l in LANES:
+        threading.Thread(target=lane_poller, args=(l,), daemon=True).start()
+        threading.Thread(target=ws_listener, args=(l,), daemon=True).start()
+    threading.Thread(target=job_poller, daemon=True).start()
+    if FLEET_LLM:
+        threading.Thread(target=fleet_poller, daemon=True).start()
+    log("%s embedded in the livestream panel — %d lane(s) from %s"
+        % (TITLE, len(LANES), os.path.basename(CONFIG_FILE)), "ok")
+
+
 def main():
     # Bind first, before starting any threads: if the port is taken there is no
     # point polling seven lanes, and a stack trace is a poor way to say
@@ -1672,5 +1773,5 @@ def main():
     srv.serve_forever()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and not EMBEDDED:
     main()
